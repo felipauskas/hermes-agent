@@ -511,6 +511,36 @@ class _PollingStallError(RuntimeError):
     """
 
 
+_DEV_INFRA_COMMANDS: frozenset[str] = frozenset({
+    "config", "debug", "model", "codex_runtime", "verbose", "diff", "yolo", "approvals", "reasoning",
+    "fast", "skin", "indicator", "battery", "timestamps", "footer", "focus", "personality", "wake",
+    "busy", "egress", "context", "rollback", "snapshot", "worktree", "branch", "compress", "cron",
+    "curator", "kanban", "browser", "plugins", "platform", "platforms", "usage", "subscription",
+    "login", "topup", "insights", "version", "whoami", "memory", "bundles", "init", "handoff", "topic",
+})
+_DEV_INFRA_PREFIXES: tuple[str, ...] = ("tool", "reload", "config", "debug", "model")
+
+
+def _is_dev_infra_command(name: str) -> bool:
+    clean = name.lstrip("/").lower().replace("-", "_")
+    return clean in _DEV_INFRA_COMMANDS or any(clean.startswith(p) for p in _DEV_INFRA_PREFIXES)
+
+
+def prioritize_telegram_menu_commands(
+    commands: list[tuple[str, str]],
+    max_commands: int = 60,
+    *,
+    invert: bool = False,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Prioritize Telegram menu commands: domain/assistant commands win over dev/infra commands."""
+    if len(commands) <= max_commands:
+        return list(commands), []
+    should_invert = invert or os.getenv("HERMES_TELEGRAM_INVERT_MENU_PRIORITY", "").lower() in ("1", "true")
+    key_fn = (lambda c: 0 if _is_dev_infra_command(c[0]) else 1) if should_invert else (lambda c: 1 if _is_dev_infra_command(c[0]) else 0)
+    ordered = sorted(commands, key=key_fn)
+    return ordered[:max_commands], ordered[max_commands:]
+
+
 class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -2685,7 +2715,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         max_commands = telegram_menu_max_commands()
         # Skill discovery resolves every skill path on disk; a slow filesystem after a reconnect must
         # not hold the gateway loop past the liveness watchdog (#110707). Only the Bot API call stays here.
-        menu_commands, hidden_count = await asyncio.to_thread(telegram_menu_commands, max_commands=max_commands)
+        raw_commands, upstream_hidden = await asyncio.to_thread(
+            telegram_menu_commands, max_commands=max(100, max_commands))
+        menu_commands, hidden_commands = prioritize_telegram_menu_commands(raw_commands, max_commands=max_commands)
+        hidden_count = len(hidden_commands) + upstream_hidden
         bot_commands = self._bot_commands(menu_commands)
         # Descriptions are localized, so the fingerprint carries the language: a display.language change
         # invalidates the lazily registered forum scopes (and any future "skip if unchanged" check).
@@ -2701,9 +2734,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             except Exception as scope_err:
                 logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
         if hidden_count:
+            hidden_names = ", ".join(f"/{name}" for name, _ in hidden_commands)
+            suffix = f": {hidden_names}" if hidden_names else ""
             logger.info(
-                "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
-                self.name, len(menu_commands), hidden_count, max_commands)
+                "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit)%s. Use /commands for full list.",
+                self.name, len(menu_commands), hidden_count, max_commands, suffix)
 
     @staticmethod
     def _bot_commands(menu_commands) -> list:
@@ -6428,8 +6463,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     return
                 from telegram import BotCommandScopeChat
                 from hermes_cli.commands_platforms import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = await asyncio.to_thread(
-                    telegram_menu_commands, max_commands=telegram_menu_max_commands())
+                max_commands = telegram_menu_max_commands()
+                raw_commands, _ = await asyncio.to_thread(
+                    telegram_menu_commands, max_commands=max(100, max_commands))
+                menu_commands, _ = prioritize_telegram_menu_commands(raw_commands, max_commands=max_commands)
                 bot_commands = self._bot_commands(menu_commands)
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
